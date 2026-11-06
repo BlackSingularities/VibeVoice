@@ -40,6 +40,52 @@ def get_timestamp():
     ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     return timestamp
 
+# Jeden przebieg modelu jest ograniczony oknem pozycji dekodera
+# (max_position_embeddings). Dluzszy tekst dzielimy na fragmenty generowane
+# kolejno tym samym glosem, a laczny czas nagrania ograniczamy do
+# MAX_LENGTH_MULTIPLIER-krotnosci tego, co miesci sie w jednym przebiegu.
+MAX_LENGTH_MULTIPLIER = int(os.environ.get("VIBEVOICE_MAX_LENGTH_MULTIPLIER", "5"))
+CHUNK_MAX_CHARS = int(os.environ.get("VIBEVOICE_CHUNK_MAX_CHARS", "1500"))
+SPEECH_TOKENS_PER_SECOND = 7.5
+
+
+def split_text_for_tts(text: str, max_chars: int = CHUNK_MAX_CHARS) -> list:
+    """Dzieli tekst na fragmenty <= max_chars: po akapitach, potem po zdaniach."""
+    import re
+
+    chunks: list = []
+    current = ""
+
+    def push(piece: str) -> None:
+        nonlocal current
+        piece = piece.strip()
+        if not piece:
+            return
+        if current and len(current) + 1 + len(piece) > max_chars:
+            chunks.append(current)
+            current = ""
+        current = f"{current} {piece}".strip() if current else piece
+
+    for paragraph in re.split(r"\n\s*\n", text):
+        paragraph = " ".join(paragraph.split())
+        if not paragraph:
+            continue
+        if len(paragraph) <= max_chars:
+            push(paragraph)
+            continue
+        for sentence in re.findall(r"[^.!?…]+[.!?…]*", paragraph):
+            sentence = sentence.strip()
+            while len(sentence) > max_chars:
+                cut = sentence.rfind(" ", 0, max_chars)
+                cut = cut if cut > 0 else max_chars
+                push(sentence[:cut])
+                sentence = sentence[cut:].strip()
+            push(sentence)
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 class StreamingTTSService:
     def __init__(
         self,
@@ -234,7 +280,7 @@ class StreamingTTSService:
             traceback.print_exc()
             audio_streamer.end()
 
-    def stream(
+    def _stream_single(
         self,
         text: str,
         cfg_scale: float = 1.5,
@@ -328,6 +374,59 @@ class StreamingTTSService:
             if errors:
                 emit("generation_error", message=str(errors[0]))
                 raise errors[0]
+
+    def max_total_seconds(self) -> float:
+        """Laczny limit nagrania: MAX_LENGTH_MULTIPLIER x pojemnosc jednego przebiegu."""
+        positions = 8192
+        try:
+            positions = int(self.model.config.decoder_config.max_position_embeddings)
+        except Exception:
+            pass
+        return MAX_LENGTH_MULTIPLIER * positions / SPEECH_TOKENS_PER_SECOND
+
+    def stream(
+        self,
+        text: str,
+        log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+        **kwargs: Any,
+    ) -> Iterator[np.ndarray]:
+        chunks = split_text_for_tts(text)
+        if not chunks:
+            return
+        stop_signal = stop_event or threading.Event()
+        limit_samples = int(self.max_total_seconds() * self.sample_rate)
+        total_samples = 0
+        for index, chunk in enumerate(chunks):
+            if stop_signal.is_set():
+                break
+            if log_callback and len(chunks) > 1:
+                try:
+                    log_callback("chunk_started", index=index + 1, total=len(chunks), chars=len(chunk))
+                except Exception:
+                    pass
+            # Kazdy fragment dostaje wlasny sygnal stopu, bo _stream_single
+            # ustawia go po zakonczeniu; zewnetrzny stop przekazujemy dalej.
+            chunk_stop = threading.Event()
+            for audio in self._stream_single(chunk, log_callback=log_callback, stop_event=chunk_stop, **kwargs):
+                if stop_signal.is_set():
+                    chunk_stop.set()
+                    break
+                remaining = limit_samples - total_samples
+                if remaining <= 0:
+                    chunk_stop.set()
+                    break
+                if audio.size > remaining:
+                    audio = audio[:remaining]
+                total_samples += int(audio.size)
+                yield audio
+            if total_samples >= limit_samples:
+                if log_callback:
+                    try:
+                        log_callback("max_length_reached", seconds=total_samples / self.sample_rate)
+                    except Exception:
+                        pass
+                break
 
     def chunk_to_pcm16(self, chunk: np.ndarray) -> bytes:
         chunk = np.clip(chunk, -1.0, 1.0)
