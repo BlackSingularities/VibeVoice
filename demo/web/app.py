@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import FileResponse
+from fastapi import Body, FastAPI, HTTPException, WebSocket
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
@@ -25,6 +25,12 @@ from vibevoice.processor.vibevoice_streaming_processor import (
     VibeVoiceStreamingProcessor,
 )
 from vibevoice.modular.streamer import AudioStreamer
+from vibevoice.text_normalization import normalize_polish
+
+try:
+    from .jobs import JobManager
+except ImportError:  # uruchomione jako zwykly modul, nie jako pakiet web
+    from jobs import JobManager
 
 import copy
 
@@ -47,6 +53,27 @@ def get_timestamp():
 MAX_LENGTH_MULTIPLIER = int(os.environ.get("VIBEVOICE_MAX_LENGTH_MULTIPLIER", "5"))
 CHUNK_MAX_CHARS = int(os.environ.get("VIBEVOICE_CHUNK_MAX_CHARS", "1500"))
 SPEECH_TOKENS_PER_SECOND = 7.5
+
+
+_POLISH_CHARS = set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ")
+
+
+def should_normalize_polish(mode: str, voice: Optional[str], text: str) -> bool:
+    if mode in ("off", "0", "false", "none"):
+        return False
+    if mode == "pl":
+        return True
+    return bool((voice or "").lower().startswith("pl-") or any(ch in _POLISH_CHARS for ch in text))
+
+
+def prepare_text(text: str, mode: str, voice: Optional[str], phonetic: bool) -> str:
+    text = (text or "").replace("’", "'").strip()
+    if should_normalize_polish(mode, voice, text):
+        return normalize_polish(text, phonetic=phonetic)
+    return text
+
+
+OUTPUT_DIR = Path(os.environ.get("VIBEVOICE_OUTPUT_DIR", BASE.parent.parent / "outputs" / "jobs"))
 
 
 def split_text_for_tts(text: str, max_chars: int = CHUNK_MAX_CHARS) -> list:
@@ -102,6 +129,7 @@ class StreamingTTSService:
         self.model: Optional[VibeVoiceStreamingForConditionalGenerationInference] = None
         self.voice_presets: Dict[str, Path] = {}
         self.default_voice_key: Optional[str] = None
+        self.generation_lock = threading.Lock()
         self._voice_cache: Dict[str, Tuple[object, Path, str]] = {}
 
         if device == "mpx":
@@ -391,6 +419,18 @@ class StreamingTTSService:
         stop_event: Optional[threading.Event] = None,
         **kwargs: Any,
     ) -> Iterator[np.ndarray]:
+        # Jeden GPU = jedna generacja naraz (tryb na zywo i kolejka zadan
+        # dziela ta sama blokade, wiec nigdy sie nie zderza).
+        with self.generation_lock:
+            yield from self._stream_locked(text, log_callback=log_callback, stop_event=stop_event, **kwargs)
+
+    def _stream_locked(
+        self,
+        text: str,
+        log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        stop_event: Optional[threading.Event] = None,
+        **kwargs: Any,
+    ) -> Iterator[np.ndarray]:
         chunks = split_text_for_tts(text)
         if not chunks:
             return
@@ -455,7 +495,20 @@ async def _startup() -> None:
     app.state.model_path = model_path
     app.state.device = device
     app.state.websocket_lock = asyncio.Lock()
-    print("[startup] Model ready.")
+    app.state.jobs = JobManager(
+        root=OUTPUT_DIR,
+        sample_rate=service.sample_rate,
+        generate=service.stream,
+        split_text=split_text_for_tts,
+        prepare_text=lambda payload: prepare_text(
+            str(payload.get("text") or ""),
+            str(payload.get("normalize") or "auto"),
+            payload.get("voice"),
+            bool(payload.get("phonetic", True)),
+        ),
+        max_seconds=service.max_total_seconds,
+    )
+    print(f"[startup] Model ready. Jobs dir: {OUTPUT_DIR}")
 
 
 def streaming_tts(text: str, **kwargs) -> Iterator[np.ndarray]:
@@ -487,11 +540,11 @@ async def websocket_stream(ws: WebSocket) -> None:
     service: StreamingTTSService = app.state.tts_service
     lock: asyncio.Lock = app.state.websocket_lock
 
-    if lock.locked():
+    if lock.locked() or service.generation_lock.locked():
         busy_message = {
             "type": "log",
             "event": "backend_busy",
-            "data": {"message": "Please wait for the other requests to complete."},
+            "data": {"message": "Model jest zajęty (inne generowanie lub zadanie z kolejki). Spróbuj za chwilę albo dodaj tekst do kolejki."},
             "timestamp": get_timestamp(),
         }
         print("Please wait for the other requests to complete.")
@@ -529,6 +582,17 @@ async def websocket_stream(ws: WebSocket) -> None:
                 except Exception:
                     break
 
+        # Polska normalizacja tekstu: liczby, daty, godziny, wieki, skroty
+        # slownie (+ fonetyka obcych slow). "auto" = dla polskiego glosu
+        # albo tekstu z polskimi znakami.
+        normalize_param = (ws.query_params.get("normalize") or "auto").lower()
+        phonetic = ws.query_params.get("phonetic", "1") not in ("0", "false", "off")
+        if should_normalize_polish(normalize_param, voice_param, text):
+            original_text = text
+            text = normalize_polish(text, phonetic=phonetic)
+            enqueue_log("text_normalized", language="pl", phonetic=phonetic, text=text,
+                        changed=text != original_text)
+
         enqueue_log(
             "backend_request_received",
             text_length=len(text or ""),
@@ -550,10 +614,24 @@ async def websocket_stream(ws: WebSocket) -> None:
         sentinel = object()
         first_ws_send_logged = False
 
+        # Serwer sam nic nie czyta z gniazda, wiec bez tego nie zauwazylby
+        # zamkniecia karty - generowalby dalej w proznie, blokujac GPU.
+        async def watch_disconnect() -> None:
+            try:
+                while True:
+                    message = await ws.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+            except Exception:
+                pass
+            stop_signal.set()
+
+        watcher = asyncio.create_task(watch_disconnect())
+
         await flush_logs()
 
         try:
-            while ws.client_state == WebSocketState.CONNECTED:
+            while ws.client_state == WebSocketState.CONNECTED and not stop_signal.is_set():
                 await flush_logs()
                 chunk = await asyncio.to_thread(next, iterator, sentinel)
                 if chunk is sentinel:
@@ -576,6 +654,7 @@ async def websocket_stream(ws: WebSocket) -> None:
             stop_signal.set()
         finally:
             stop_signal.set()
+            watcher.cancel()
             enqueue_log("backend_stream_complete")
             await flush_logs()
             try:
@@ -603,7 +682,13 @@ async def websocket_stream(ws: WebSocket) -> None:
 
 @app.get("/")
 def index():
-    return FileResponse(BASE / "index.html")
+    return FileResponse(BASE / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/classic")
+def classic():
+    """Pierwotny interfejs demo (tylko tryb na zywo)."""
+    return FileResponse(BASE / "classic.html")
 
 
 @app.get("/config")
@@ -613,5 +698,125 @@ def get_config():
     return {
         "voices": voices,
         "default_voice": service.default_voice_key,
+        "max_seconds": service.max_total_seconds(),
+        "chunk_max_chars": CHUNK_MAX_CHARS,
+        "sample_rate": service.sample_rate,
     }
+
+
+# ---------------------------------------------------------------------------
+# API zadan (niezawodne generowanie do pliku) i narzedzia
+# ---------------------------------------------------------------------------
+
+def _jobs() -> JobManager:
+    return app.state.jobs
+
+
+@app.get("/api/health")
+def api_health():
+    service: StreamingTTSService = app.state.tts_service
+    gpu = None
+    if torch.cuda.is_available():
+        try:
+            free, total = torch.cuda.mem_get_info()
+            gpu = {
+                "name": torch.cuda.get_device_name(0),
+                "memory_used_gb": round((total - free) / 1024 ** 3, 2),
+                "memory_total_gb": round(total / 1024 ** 3, 2),
+            }
+        except Exception:
+            gpu = {"name": torch.cuda.get_device_name(0)}
+    return {
+        "ok": service.model is not None,
+        "device": service.device,
+        "gpu": gpu,
+        "busy": service.generation_lock.locked(),
+        "jobs": _jobs().status(),
+        "time": get_timestamp(),
+    }
+
+
+@app.post("/api/normalize")
+def api_normalize(payload: Dict[str, Any] = Body(...)):
+    text = str(payload.get("text") or "")
+    mode = str(payload.get("normalize") or "pl")
+    result = prepare_text(text, mode, payload.get("voice"), bool(payload.get("phonetic", True)))
+    chunks = split_text_for_tts(result)
+    return {"text": result, "changed": result != text.strip(), "chunks": len(chunks), "chars": len(result)}
+
+
+@app.get("/api/jobs")
+def api_jobs():
+    return {"jobs": _jobs().list()}
+
+
+@app.post("/api/jobs", status_code=201)
+def api_job_create(payload: Dict[str, Any] = Body(...)):
+    try:
+        return _jobs().create(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs/{job_id}")
+def api_job(job_id: str):
+    job = _jobs().get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Nie ma takiego zadania.")
+    return job
+
+
+def _job_action(fn, job_id: str):
+    try:
+        return fn(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def api_job_cancel(job_id: str):
+    return _job_action(_jobs().cancel, job_id)
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def api_job_resume(job_id: str):
+    return _job_action(_jobs().resume, job_id)
+
+
+@app.delete("/api/jobs/{job_id}")
+def api_job_delete(job_id: str):
+    _job_action(_jobs().delete, job_id)
+    return {"ok": True}
+
+
+@app.get("/api/jobs/{job_id}/audio")
+def api_job_audio(job_id: str, download: int = 0):
+    path = _jobs().audio_path(job_id)
+    job = _jobs().get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Nie ma takiego zadania.")
+    filename = f"vibevoice-{job_id}.wav"
+    if path:
+        return FileResponse(
+            path, media_type="audio/wav",
+            filename=filename if download else None,
+            headers={"Cache-Control": "no-cache"},
+        )
+    data = _jobs().partial_wav(job_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Nagranie jeszcze nie powstało.")
+    headers = {"Cache-Control": "no-store"}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return Response(content=data, media_type="audio/wav", headers=headers)
+
+
+@app.get("/api/jobs/{job_id}/text")
+def api_job_text(job_id: str):
+    path = _jobs().text_path(job_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Brak tekstu zadania.")
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"vibevoice-{job_id}.txt")
 
